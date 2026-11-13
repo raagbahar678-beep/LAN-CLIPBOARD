@@ -1,5 +1,6 @@
 package com.example.myapp
 
+import android.accessibilityservice.AccessibilityService
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Notification
@@ -33,10 +34,12 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityEvent
 import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
 import android.widget.Button
@@ -513,6 +516,43 @@ class Core(val ctx: Context) {
         }
     }
 
+    // Reads the clipboard (works only when this app has focus) and sends it.
+    // Returns 1 = sent, 2 = already sent / our own clip, 0 = nothing readable.
+    fun sendCurrentClipboard(c: Context): Int {
+        try {
+            val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip ?: return 0
+            if (clip.itemCount == 0) return 0
+            val lbl = clip.description.label
+            if (lbl != null && lbl.toString() == "LAN Clipboard") return 2
+            val uris = ArrayList<Uri>()
+            val texts = ArrayList<String>()
+            val sb = StringBuilder()
+            for (k in 0 until clip.itemCount) {
+                val item = clip.getItemAt(k)
+                val u = item.uri
+                if (u != null && u.scheme == "content") {
+                    uris.add(u)
+                    sb.append(u.toString()).append('|')
+                } else {
+                    val t = item.coerceToText(c)
+                    if (t != null && t.isNotEmpty()) {
+                        texts.add(t.toString())
+                        sb.append(t.toString()).append('|')
+                    }
+                }
+            }
+            if (uris.isEmpty() && texts.isEmpty()) return 0
+            val sig = sb.length.toString() + ":" + sb.toString().hashCode().toString()
+            if (sig == prefs.getString("lastsig", "")) return 2
+            prefs.edit().putString("lastsig", sig).apply()
+            copyFiles(uris, texts)
+            return 1
+        } catch (e: Exception) {
+            return 0
+        }
+    }
+
     // ---- copying (staging + sending) ----
 
     fun copyFiles(uris: List<Uri>, texts: List<String>) {
@@ -922,6 +962,95 @@ class ClipProvider : ContentProvider() {
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
 }
 
+// ───────────────────────── auto-detect copy (accessibility) ─────────────────────────
+
+// Invisible screen that appears for a split second so Android lets us read the clipboard.
+class ClipGrabActivity : Activity() {
+    private var done = false
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && !done) {
+            done = true
+            try {
+                val core = CoreHolder.get(applicationContext)
+                core.start()
+                core.sendCurrentClipboard(this)
+            } catch (e: Exception) {
+            }
+            finish()
+        }
+    }
+}
+
+class ClipAccessService : AccessibilityService() {
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastTrigger = 0L
+    private val copyWord = Regex("\\b(copy|cut)\\b")
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        try {
+            CoreHolder.get(applicationContext).start()
+        } catch (e: Exception) {
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) return
+        if (!looksLikeCopy(event)) return
+        trigger()
+    }
+
+    // Ctrl+C / Ctrl+X (or Meta+C / Meta+X) on an external keyboard
+    override fun onKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+            (event.isCtrlPressed || event.isMetaPressed) &&
+            (event.keyCode == KeyEvent.KEYCODE_C || event.keyCode == KeyEvent.KEYCODE_X)
+        ) {
+            trigger()
+        }
+        return false
+    }
+
+    private fun trigger() {
+        val now = System.currentTimeMillis()
+        if (now - lastTrigger < 800L) return
+        lastTrigger = now
+        handler.postDelayed({ grab() }, 350)
+    }
+
+    override fun onInterrupt() {
+    }
+
+    private fun looksLikeCopy(e: AccessibilityEvent): Boolean {
+        val sb = StringBuilder()
+        val cd = e.contentDescription
+        if (cd != null) sb.append(cd.toString()).append(' ')
+        for (t in e.text) {
+            if (t != null) sb.append(t.toString()).append(' ')
+        }
+        return copyWord.containsMatchIn(sb.toString().lowercase())
+    }
+
+    private fun grab() {
+        var r = 0
+        try {
+            r = CoreHolder.get(applicationContext).sendCurrentClipboard(this)
+        } catch (e: Exception) {
+        }
+        if (r == 0) {
+            try {
+                val i = Intent(this, ClipGrabActivity::class.java)
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                startActivity(i)
+            } catch (e: Exception) {
+            }
+        }
+    }
+}
+
 object CoreHolder {
     @Volatile var core: Core? = null
 
@@ -975,6 +1104,12 @@ class MainActivity : Activity() {
     private var lastSig = ""
     private val REQ_FILES = 11
     private val REQ_FOLDER = 12
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        try {
+            core.sendCurrentClipboard(this)
+        } catch (e: Exception) {
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -984,6 +1119,7 @@ class MainActivity : Activity() {
         core.statusListener = { msg -> statusView.text = msg }
         statusView.text = core.lastStatus
         core.start()
+        handleShare(intent)
         try {
             startForegroundService(Intent(this, KeepAliveService::class.java))
         } catch (e: Exception) {
@@ -997,8 +1133,29 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleShare(intent)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            try {
+                core.sendCurrentClipboard(this)
+            } catch (e: Exception) {
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.removePrimaryClipChangedListener(clipListener)
+            cm.addPrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
         core.onChange = { refresh() }
         core.statusListener = { msg -> statusView.text = msg }
         statusView.text = core.lastStatus
@@ -1007,6 +1164,11 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.removePrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
         core.saveAll()
     }
 
@@ -1067,6 +1229,7 @@ class MainActivity : Activity() {
         row2.addView(mkBtn("Copy Last") { copyLatest() })
         row2.addView(mkBtn("Clear") { core.clearAll() })
         row2.addView(mkBtn("Name") { nameDialog() })
+        row2.addView(mkBtn("Auto Setup") { openAccessSettings() })
         root.addView(row2, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         statusView = TextView(this)
@@ -1343,6 +1506,40 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun openAccessSettings() {
+        toast("Find 'LAN Clipboard auto-detect' and turn it on")
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (e: Exception) {
+            toast("Cannot open settings")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleShare(i: Intent?) {
+        if (i == null) return
+        val a = i.action
+        if (a != Intent.ACTION_SEND && a != Intent.ACTION_SEND_MULTIPLE) return
+        val uris = ArrayList<Uri>()
+        val texts = ArrayList<String>()
+        if (a == Intent.ACTION_SEND) {
+            val u = i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            if (u != null) {
+                uris.add(u)
+            } else {
+                val t = i.getCharSequenceExtra(Intent.EXTRA_TEXT)
+                if (t != null && t.isNotEmpty()) texts.add(t.toString())
+            }
+        } else {
+            val l = i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+            if (l != null) uris.addAll(l)
+        }
+        if (uris.isEmpty() && texts.isEmpty()) return
+        i.action = null
+        core.copyFiles(uris, texts)
+        toast("Sending to your other devices...")
     }
 
     private fun copyLatest() {
