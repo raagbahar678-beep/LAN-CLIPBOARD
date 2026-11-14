@@ -245,7 +245,30 @@ class Core(val ctx: Context) {
 
     // ---- start networking ----
 
+    fun enabled(): Boolean = prefs.getBoolean("enabled", true)
+
+    fun setEnabled(on: Boolean) {
+        prefs.edit().putBoolean("enabled", on).apply()
+        if (on) {
+            start()
+            try {
+                ctx.startForegroundService(Intent(ctx, KeepAliveService::class.java))
+            } catch (e: Exception) {
+            }
+            status("LAN Clipboard is ON.")
+        } else {
+            try {
+                ctx.stopService(Intent(ctx, KeepAliveService::class.java))
+            } catch (e: Exception) {
+            }
+            stop()
+            status("LAN Clipboard is OFF - nothing is sent or received.")
+        }
+        changed()
+    }
+
     fun start() {
+        if (!enabled()) return
         if (running) return
         running = true
         gen += 1
@@ -301,7 +324,6 @@ class Core(val ctx: Context) {
             cpuLock?.release()
         } catch (e: Exception) {
         }
-        status("LAN copy is off.")
         changed()
     }
 
@@ -710,6 +732,7 @@ class Core(val ctx: Context) {
     // Reads the clipboard (works only when this app has focus) and sends it.
     // Returns 1 = sent, 2 = already sent / our own clip, 0 = nothing readable.
     fun sendCurrentClipboard(c: Context): Int {
+        if (!enabled()) return 2
         try {
             val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val ts: Long = cm.primaryClipDescription?.timestamp ?: 0L
@@ -756,6 +779,10 @@ class Core(val ctx: Context) {
     // ---- copying (staging + sending) ----
 
     fun copyFiles(uris: List<Uri>, texts: List<String>) {
+        if (!enabled()) {
+            status("LAN Clipboard is OFF - turn it ON first.")
+            return
+        }
         pool.execute {
             val list = ArrayList<OutItem>()
             for (u in uris) {
@@ -803,6 +830,10 @@ class Core(val ctx: Context) {
     }
 
     fun resend() {
+        if (!enabled()) {
+            status("LAN Clipboard is OFF - turn it ON first.")
+            return
+        }
         if (staged.isEmpty()) {
             status("Nothing copied yet.")
             return
@@ -1440,6 +1471,10 @@ class ClipAccessService : AccessibilityService() {
     }
 
     private fun trigger() {
+        try {
+            if (!CoreHolder.get(applicationContext).enabled()) return
+        } catch (e: Exception) {
+        }
         val now = System.currentTimeMillis()
         if (now - lastTrigger < 1200L) return
         lastTrigger = now
@@ -1596,6 +1631,14 @@ class KeepAliveService : Service() {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } catch (e: Exception) {
         }
+        if (!CoreHolder.get(applicationContext).enabled()) {
+            try {
+                stopForeground(true)
+            } catch (e: Exception) {
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
         CoreHolder.get(applicationContext).start()
         return START_STICKY
     }
@@ -1608,6 +1651,7 @@ class MainActivity : Activity() {
     private lateinit var core: Core
     private lateinit var statusView: TextView
     private lateinit var titleView: TextView
+    private lateinit var onoffBtn: Button
     private lateinit var listView: ListView
     private lateinit var detectBtn: Button
     private val rows = ArrayList<Row>()
@@ -1634,7 +1678,7 @@ class MainActivity : Activity() {
         handleShare(intent)
         Handler(Looper.getMainLooper()).postDelayed({ askBatteryExemption(this, core.prefs) }, 2500)
         try {
-            startForegroundService(Intent(this, KeepAliveService::class.java))
+            if (core.enabled()) startForegroundService(Intent(this, KeepAliveService::class.java))
         } catch (e: Exception) {
         }
         try {
@@ -1729,6 +1773,19 @@ class MainActivity : Activity() {
         titleView.setPadding(dp(6), dp(2), dp(6), dp(4))
         root.addView(titleView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
+        onoffBtn = Button(this)
+        onoffBtn.isAllCaps = false
+        onoffBtn.textSize = 16f
+        onoffBtn.setTextColor(Color.WHITE)
+        onoffBtn.setTypeface(null, Typeface.BOLD)
+        onoffBtn.isFocusable = false
+        onoffBtn.isFocusableInTouchMode = false
+        onoffBtn.setOnClickListener { toggleOnOff() }
+        val lpOnOff = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56))
+        lpOnOff.setMargins(dp(3), dp(3), dp(3), dp(6))
+        root.addView(onoffBtn, lpOnOff)
+        updateOnOff()
+
         val row1 = LinearLayout(this)
         row1.orientation = LinearLayout.HORIZONTAL
         row1.addView(mkBtn("Copy Files") { openFiles() })
@@ -1793,7 +1850,8 @@ class MainActivity : Activity() {
     // ---- list ----
 
     private fun refresh() {
-        titleView.text = "LAN Clipboard  -  " + core.myName
+        titleView.text = "LAN Clipboard  -  " + core.myName + (if (core.enabled()) "" else "  (OFF)")
+        updateOnOff()
         val list = ArrayList<Row>()
         list.add(Row(0, "DEVICES (remembered - tap to turn on/off)", ""))
         val ps = ArrayList<Peer>(core.peers.values)
@@ -2027,6 +2085,23 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun updateOnOff() {
+        val on = core.enabled()
+        onoffBtn.text = if (on) "LAN CLIPBOARD: ON   (tap to turn OFF)" else "LAN CLIPBOARD: OFF   (tap to turn ON)"
+        val bg = GradientDrawable()
+        bg.setColor(Color.parseColor(if (on) "#2E7D32" else "#C62828"))
+        bg.cornerRadius = dp(10).toFloat()
+        onoffBtn.background = RippleDrawable(ColorStateList.valueOf(Color.argb(90, 255, 255, 255)), bg, null)
+    }
+
+    private fun toggleOnOff() {
+        val now = !core.enabled()
+        core.setEnabled(now)
+        updateOnOff()
+        refresh()
+        toast(if (now) "ON: copy and paste between your phones is active" else "OFF: nothing will be sent or received")
     }
 
     private fun updateDetectLabel() {
