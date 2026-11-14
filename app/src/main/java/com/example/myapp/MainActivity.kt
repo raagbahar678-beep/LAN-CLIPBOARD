@@ -43,6 +43,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
 import android.widget.Button
@@ -192,6 +193,7 @@ class Core(val ctx: Context) {
     private var cpuLock: PowerManager.WakeLock? = null
     @Volatile var lastErr: String = ""
     @Volatile var ownSetAt: Long = 0L
+    @Volatile private var lastClipTs: Long = 0L
     @Volatile private var lastSigVal: String = ""
     @Volatile private var lastSigTime: Long = 0L
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -710,10 +712,15 @@ class Core(val ctx: Context) {
     fun sendCurrentClipboard(c: Context): Int {
         try {
             val cm = c.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val ts: Long = cm.primaryClipDescription?.timestamp ?: 0L
+            if (ts != 0L && ts == lastClipTs) return 2
             val clip = cm.primaryClip ?: return 0
             if (clip.itemCount == 0) return 0
             val lbl = clip.description.label
-            if (lbl != null && lbl.toString() == "LAN Clipboard") return 2
+            if (lbl != null && lbl.toString() == "LAN Clipboard") {
+                lastClipTs = ts
+                return 2
+            }
             val uris = ArrayList<Uri>()
             val texts = ArrayList<String>()
             val sb = StringBuilder()
@@ -734,6 +741,7 @@ class Core(val ctx: Context) {
             if (uris.isEmpty() && texts.isEmpty()) return 0
             val sig = sb.length.toString() + ":" + sb.toString().hashCode().toString()
             val nowT = System.currentTimeMillis()
+            lastClipTs = ts
             if (nowT - ownSetAt < 2500L) return 2
             if (sig == lastSigVal && nowT - lastSigTime < 3000L) return 2
             lastSigVal = sig
@@ -1338,11 +1346,86 @@ class ClipAccessService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private val copiedWord = Regex("\\bcopied\\b")
+
+    private fun strongMode(): Boolean {
+        return try {
+            CoreHolder.get(applicationContext).prefs.getBoolean("aggr", true)
+        } catch (e: Exception) {
+            true
+        }
+    }
+
+    private fun shortText(n: AccessibilityNodeInfo, sb: StringBuilder) {
+        val cd = n.contentDescription
+        if (cd != null && cd.length < 40) sb.append(cd.toString()).append(' ')
+        val tx = n.text
+        if (tx != null && tx.length < 40) sb.append(tx.toString()).append(' ')
+        val id = n.viewIdResourceName
+        if (id != null) sb.append(id).append(' ')
+    }
+
+    // Looks at the tapped element, its children and its parents for the word "copy".
+    private fun nodeSaysCopy(n: AccessibilityNodeInfo?): Boolean {
+        if (n == null) return false
+        try {
+            val sb = StringBuilder()
+            shortText(n, sb)
+            var par: AccessibilityNodeInfo? = n.parent
+            var up = 0
+            while (par != null && up < 3) {
+                shortText(par, sb)
+                par = par.parent
+                up += 1
+            }
+            var k = 0
+            while (k < n.childCount && k < 8) {
+                val c = n.getChild(k)
+                if (c != null) {
+                    shortText(c, sb)
+                    var g = 0
+                    while (g < c.childCount && g < 4) {
+                        val gc = c.getChild(g)
+                        if (gc != null) shortText(gc, sb)
+                        g += 1
+                    }
+                }
+                k += 1
+            }
+            return copyWord.containsMatchIn(sb.toString().lowercase())
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
+    private fun eventText(e: AccessibilityEvent): String {
+        val sb = StringBuilder()
+        val cd = e.contentDescription
+        if (cd != null) sb.append(cd.toString()).append(' ')
+        for (t in e.text) {
+            if (t != null) sb.append(t.toString()).append(' ')
+        }
+        return sb.toString().lowercase()
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) return
-        if (!looksLikeCopy(event)) return
-        trigger()
+        val pkg = event.packageName
+        if (pkg != null && pkg.toString() == packageName) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                if (strongMode()) {
+                    trigger()
+                } else if (looksLikeCopy(event) || nodeSaysCopy(event.source)) {
+                    trigger()
+                }
+            }
+            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                val t = eventText(event)
+                if (t.length < 120 && copiedWord.containsMatchIn(t)) trigger()
+            }
+        }
     }
 
     // Ctrl+C / Ctrl+X (or Meta+C / Meta+X) on an external keyboard
@@ -1358,7 +1441,7 @@ class ClipAccessService : AccessibilityService() {
 
     private fun trigger() {
         val now = System.currentTimeMillis()
-        if (now - lastTrigger < 600L) return
+        if (now - lastTrigger < 1200L) return
         lastTrigger = now
         handler.postDelayed({ grab() }, 150)
     }
@@ -1415,6 +1498,10 @@ class ClipAccessService : AccessibilityService() {
         } else if (overlayTries >= 6) {
             overlayDone = true
             removeOverlay()
+            try {
+                CoreHolder.get(applicationContext).status("Auto-copy: could not read clipboard, trying fallback screen")
+            } catch (e: Exception) {
+            }
             launchGrabActivity()
         } else {
             handler.postDelayed({ overlayAttempt() }, 100)
@@ -1522,6 +1609,7 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var titleView: TextView
     private lateinit var listView: ListView
+    private lateinit var detectBtn: Button
     private val rows = ArrayList<Row>()
     private val adapter = RowAdapter()
     private var pendingPasteId: String? = null
@@ -1656,6 +1744,13 @@ class MainActivity : Activity() {
         row2.addView(mkBtn("Name") { nameDialog() })
         row2.addView(mkBtn("Auto Setup") { openAccessSettings() })
         root.addView(row2, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val row3 = LinearLayout(this)
+        row3.orientation = LinearLayout.HORIZONTAL
+        detectBtn = mkBtn("") { toggleDetect() }
+        row3.addView(detectBtn)
+        root.addView(row3, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        updateDetectLabel()
 
         statusView = TextView(this)
         statusView.textSize = 13f
@@ -1932,6 +2027,18 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun updateDetectLabel() {
+        val strong = core.prefs.getBoolean("aggr", true)
+        detectBtn.text = if (strong) "Auto-copy detect: ANY TAP (strongest)  - tap to change" else "Auto-copy detect: only Copy buttons  - tap to change"
+    }
+
+    private fun toggleDetect() {
+        val strong = core.prefs.getBoolean("aggr", true)
+        core.prefs.edit().putBoolean("aggr", !strong).apply()
+        updateDetectLabel()
+        toast(if (!strong) "Strongest mode: every tap is checked for a new copy" else "Only taps on Copy buttons are checked")
     }
 
     private fun openAccessSettings() {
