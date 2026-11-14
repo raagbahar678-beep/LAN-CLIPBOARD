@@ -189,6 +189,9 @@ class Core(val ctx: Context) {
     @Volatile private var annSock: DatagramSocket? = null
     private var cpuLock: PowerManager.WakeLock? = null
     @Volatile var lastErr: String = ""
+    @Volatile var ownSetAt: Long = 0L
+    @Volatile private var lastSigVal: String = ""
+    @Volatile private var lastSigTime: Long = 0L
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -646,6 +649,7 @@ class Core(val ctx: Context) {
     fun setClipboardText(t: String) {
         try {
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            ownSetAt = System.currentTimeMillis()
             cm.setPrimaryClip(ClipData.newPlainText("LAN Clipboard", t))
         } catch (e: Exception) {
         }
@@ -691,6 +695,7 @@ class Core(val ctx: Context) {
             }
             val fin = clip ?: return false
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            ownSetAt = System.currentTimeMillis()
             cm.setPrimaryClip(fin)
             return true
         } catch (e: Exception) {
@@ -726,8 +731,11 @@ class Core(val ctx: Context) {
             }
             if (uris.isEmpty() && texts.isEmpty()) return 0
             val sig = sb.length.toString() + ":" + sb.toString().hashCode().toString()
-            if (sig == prefs.getString("lastsig", "")) return 2
-            prefs.edit().putString("lastsig", sig).apply()
+            val nowT = System.currentTimeMillis()
+            if (nowT - ownSetAt < 2500L) return 2
+            if (sig == lastSigVal && nowT - lastSigTime < 3000L) return 2
+            lastSigVal = sig
+            lastSigTime = nowT
             copyFiles(uris, texts)
             return 1
         } catch (e: Exception) {
@@ -1259,19 +1267,37 @@ class ClipProvider : ContentProvider() {
 // Invisible screen that appears for a split second so Android lets us read the clipboard.
 class ClipGrabActivity : Activity() {
     private var done = false
+    private var tries = 0
+    private val h = Handler(Looper.getMainLooper())
+
+    private fun attempt() {
+        if (done) return
+        var r = 0
+        try {
+            val core = CoreHolder.get(applicationContext)
+            core.start()
+            r = core.sendCurrentClipboard(this)
+        } catch (e: Exception) {
+        }
+        tries += 1
+        if (r != 0 || tries >= 6) {
+            done = true
+            finish()
+        } else {
+            h.postDelayed({ attempt() }, 120)
+        }
+    }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && !done) {
-            done = true
-            try {
-                val core = CoreHolder.get(applicationContext)
-                core.start()
-                core.sendCurrentClipboard(this)
-            } catch (e: Exception) {
-            }
-            finish()
+        if (hasFocus && tries == 0) {
+            attempt()
         }
+    }
+
+    override fun onDestroy() {
+        done = true
+        super.onDestroy()
     }
 }
 
@@ -1279,6 +1305,13 @@ class ClipAccessService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var lastTrigger = 0L
     private val copyWord = Regex("\\b(copy|cut)\\b")
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        try {
+            val core = CoreHolder.get(applicationContext)
+            if (System.currentTimeMillis() - core.ownSetAt >= 2500L) trigger()
+        } catch (e: Exception) {
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -1286,6 +1319,21 @@ class ClipAccessService : AccessibilityService() {
             CoreHolder.get(applicationContext).start()
         } catch (e: Exception) {
         }
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.removePrimaryClipChangedListener(clipListener)
+            cm.addPrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
+    }
+
+    override fun onDestroy() {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.removePrimaryClipChangedListener(clipListener)
+        } catch (e: Exception) {
+        }
+        super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -1308,9 +1356,9 @@ class ClipAccessService : AccessibilityService() {
 
     private fun trigger() {
         val now = System.currentTimeMillis()
-        if (now - lastTrigger < 800L) return
+        if (now - lastTrigger < 600L) return
         lastTrigger = now
-        handler.postDelayed({ grab() }, 350)
+        handler.postDelayed({ grab() }, 150)
     }
 
     override fun onInterrupt() {
