@@ -19,6 +19,7 @@ import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -40,6 +41,7 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.webkit.MimeTypeMap
 import android.widget.BaseAdapter
@@ -1374,20 +1376,101 @@ class ClipAccessService : AccessibilityService() {
         return copyWord.containsMatchIn(sb.toString().lowercase())
     }
 
+    private var overlay: View? = null
+    private var overlayDone = false
+    private var overlayTries = 0
+
+    private fun removeOverlay() {
+        val v = overlay
+        overlay = null
+        if (v != null) {
+            try {
+                (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun launchGrabActivity() {
+        try {
+            val i = Intent(this, ClipGrabActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            startActivity(i)
+        } catch (e: Exception) {
+        }
+    }
+
+    // Reads the clipboard while our invisible 1-pixel window holds focus (Android only allows reading then).
+    private fun overlayAttempt() {
+        if (overlayDone) return
+        var r = 0
+        try {
+            r = CoreHolder.get(applicationContext).sendCurrentClipboard(this)
+        } catch (e: Exception) {
+        }
+        overlayTries += 1
+        if (r != 0) {
+            overlayDone = true
+            removeOverlay()
+        } else if (overlayTries >= 6) {
+            overlayDone = true
+            removeOverlay()
+            launchGrabActivity()
+        } else {
+            handler.postDelayed({ overlayAttempt() }, 100)
+        }
+    }
+
     private fun grab() {
         var r = 0
         try {
             r = CoreHolder.get(applicationContext).sendCurrentClipboard(this)
         } catch (e: Exception) {
         }
-        if (r == 0) {
-            try {
-                val i = Intent(this, ClipGrabActivity::class.java)
-                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                startActivity(i)
-            } catch (e: Exception) {
+        if (r != 0) return
+        removeOverlay()
+        overlayDone = false
+        overlayTries = 0
+        var added = false
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val me = this
+            val v = object : View(me) {
+                override fun onWindowFocusChanged(hasFocus: Boolean) {
+                    super.onWindowFocusChanged(hasFocus)
+                    if (hasFocus && overlayTries == 0 && !overlayDone) {
+                        overlayAttempt()
+                    }
+                }
             }
+            val lp = WindowManager.LayoutParams(
+                1,
+                1,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            wm.addView(v, lp)
+            overlay = v
+            added = true
+        } catch (e: Exception) {
+            added = false
         }
+        if (!added) {
+            launchGrabActivity()
+            return
+        }
+        // If the overlay never receives focus, fall back to the invisible activity.
+        handler.postDelayed({
+            if (overlay != null && !overlayDone && overlayTries == 0) {
+                overlayDone = true
+                removeOverlay()
+                launchGrabActivity()
+            }
+        }, 700)
     }
 }
 
@@ -1852,6 +1935,14 @@ class MainActivity : Activity() {
     }
 
     private fun openAccessSettings() {
+        if (!Settings.canDrawOverlays(this)) {
+            toast("Step 1: turn ON 'Display over other apps' for this app, then come back and tap Auto Setup again")
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                return
+            } catch (e: Exception) {
+            }
+        }
         toast("Find 'LAN Clipboard auto-detect' and turn it on")
         try {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
