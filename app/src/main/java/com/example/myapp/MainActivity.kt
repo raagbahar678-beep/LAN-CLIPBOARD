@@ -882,11 +882,20 @@ class Core(val ctx: Context) {
         }
     }
 
-    // ---- "Copied" confirmation: shown for about 0.4 second on every copy ----
+    // ---- "Copied" confirmation: shown for 0.2 second on every copy ----
 
     private var flashToast: Toast? = null
+    @Volatile var flasher: ((String) -> Unit)? = null
 
     fun flash(msg: String) {
+        val f = flasher
+        if (f != null) {
+            try {
+                f(msg)
+                return
+            } catch (e: Exception) {
+            }
+        }
         handler.post {
             try {
                 flashToast?.cancel()
@@ -898,7 +907,7 @@ class Core(val ctx: Context) {
                         t.cancel()
                     } catch (e: Exception) {
                     }
-                }, 400)
+                }, 200)
             } catch (e: Exception) {
             }
         }
@@ -1451,6 +1460,24 @@ class ClipProvider : ContentProvider() {
 
 // Invisible screen that appears for a split second so Android lets us read the clipboard.
 class ClipGrabActivity : Activity() {
+    @Suppress("DEPRECATION")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            overridePendingTransition(0, 0)
+        } catch (e: Exception) {
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun finish() {
+        super.finish()
+        try {
+            overridePendingTransition(0, 0)
+        } catch (e: Exception) {
+        }
+    }
+
     private var done = false
     private var tries = 0
     private val h = Handler(Looper.getMainLooper())
@@ -1505,6 +1532,7 @@ class ClipAccessService : AccessibilityService() {
             CoreHolder.get(applicationContext).prefs.edit().putLong("svc_conn", System.currentTimeMillis()).apply()
         } catch (t: Throwable) {
         }
+        registerFlasher()
         handler.post {
             try {
                 CoreHolder.get(applicationContext).start()
@@ -1524,6 +1552,10 @@ class ClipAccessService : AccessibilityService() {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.removePrimaryClipChangedListener(clipListener)
         } catch (e: Exception) {
+        }
+        try {
+            CoreHolder.get(applicationContext).flasher = null
+        } catch (t: Throwable) {
         }
         super.onDestroy()
     }
@@ -1603,17 +1635,14 @@ class ClipAccessService : AccessibilityService() {
         if (pkg != null && pkg.toString() == packageName) return
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                if (strongMode()) {
-                    trigger()
-                } else if (looksLikeCopy(event) || nodeSaysCopy(event.source)) {
-                    trigger()
-                }
+                val copyLike = looksLikeCopy(event) || nodeSaysCopy(event.source)
+                if (copyLike || strongMode()) trigger(copyLike)
             }
             AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 val t = eventText(event)
-                if (t.length < 120 && copiedWord.containsMatchIn(t)) trigger()
+                if (t.length < 120 && copiedWord.containsMatchIn(t)) trigger(true)
             }
         }
     }
@@ -1624,25 +1653,38 @@ class ClipAccessService : AccessibilityService() {
             (event.isCtrlPressed || event.isMetaPressed) &&
             (event.keyCode == KeyEvent.KEYCODE_C || event.keyCode == KeyEvent.KEYCODE_X)
         ) {
-            trigger()
+            trigger(true)
         }
         return false
     }
 
-    private fun trigger() {
+    private var triggerScheduled = false
+    private var wantActivity = false
+
+    // Fast copies are never dropped: while a check is waiting, a new copy simply joins it,
+    // and a copy that arrives during a running check makes it run once more.
+    private fun trigger(copyLike: Boolean = false) {
         try {
             if (!CoreHolder.get(applicationContext).enabled()) return
         } catch (e: Exception) {
         }
-        val now = System.currentTimeMillis()
-        if (now - lastTrigger < 400L) return
-        lastTrigger = now
+        if (copyLike) wantActivity = true
+        if (grabBusy) {
+            rerun = true
+            return
+        }
+        if (triggerScheduled) return
+        triggerScheduled = true
         handler.postDelayed({
+            triggerScheduled = false
+            val act = wantActivity
+            wantActivity = false
             try {
-                grab()
+                grab(act)
             } catch (t: Throwable) {
+                grabBusy = false
             }
-        }, 150)
+        }, 70)
     }
 
     override fun onInterrupt() {
@@ -1661,6 +1703,10 @@ class ClipAccessService : AccessibilityService() {
     private var overlay: View? = null
     private var overlayDone = false
     private var overlayTries = 0
+    private var grabBusy = false
+    private var rerun = false
+    private var grabSeq = 0
+    private var grabCopyLike = false
 
     private fun removeOverlay() {
         val v = overlay
@@ -1670,6 +1716,14 @@ class ClipAccessService : AccessibilityService() {
                 (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
             } catch (e: Exception) {
             }
+        }
+    }
+
+    private fun finishGrab() {
+        grabBusy = false
+        if (rerun) {
+            rerun = false
+            trigger(false)
         }
     }
 
@@ -1683,8 +1737,8 @@ class ClipAccessService : AccessibilityService() {
     }
 
     // Reads the clipboard while our invisible 1-pixel window holds focus (Android only allows reading then).
-    private fun overlayAttempt() {
-        if (overlayDone) return
+    private fun overlayAttempt(seq: Int) {
+        if (overlayDone || seq != grabSeq) return
         var r = 0
         try {
             r = CoreHolder.get(applicationContext).sendCurrentClipboard(this)
@@ -1694,26 +1748,30 @@ class ClipAccessService : AccessibilityService() {
         if (r != 0) {
             overlayDone = true
             removeOverlay()
-        } else if (overlayTries >= 6) {
+            finishGrab()
+        } else if (overlayTries >= 5) {
             overlayDone = true
             removeOverlay()
-            try {
-                CoreHolder.get(applicationContext).status("Auto-copy: could not read clipboard, trying fallback screen")
-            } catch (e: Exception) {
-            }
-            launchGrabActivity()
+            // Fallback: a transparent screen that really has focus. Only used for taps that look like a copy,
+            // so ordinary taps never interrupt what you are doing.
+            if (grabCopyLike) launchGrabActivity()
+            finishGrab()
         } else {
-            handler.postDelayed({ overlayAttempt() }, 100)
+            handler.postDelayed({ overlayAttempt(seq) }, 50)
         }
     }
 
-    private fun grab() {
+    private fun grab(copyLike: Boolean) {
         var r = 0
         try {
             r = CoreHolder.get(applicationContext).sendCurrentClipboard(this)
         } catch (e: Exception) {
         }
         if (r != 0) return
+        grabBusy = true
+        grabCopyLike = copyLike
+        grabSeq += 1
+        val seq = grabSeq
         removeOverlay()
         overlayDone = false
         overlayTries = 0
@@ -1724,8 +1782,8 @@ class ClipAccessService : AccessibilityService() {
             val v = object : View(me) {
                 override fun onWindowFocusChanged(hasFocus: Boolean) {
                     super.onWindowFocusChanged(hasFocus)
-                    if (hasFocus && overlayTries == 0 && !overlayDone) {
-                        overlayAttempt()
+                    if (hasFocus && overlayTries == 0 && !overlayDone && seq == grabSeq) {
+                        overlayAttempt(seq)
                     }
                 }
             }
@@ -1746,17 +1804,87 @@ class ClipAccessService : AccessibilityService() {
             added = false
         }
         if (!added) {
-            launchGrabActivity()
+            if (copyLike) launchGrabActivity()
+            finishGrab()
             return
         }
-        // If the overlay never receives focus, fall back to the invisible activity.
+        // If the overlay never receives focus, use the invisible activity (copy-like taps only).
         handler.postDelayed({
-            if (overlay != null && !overlayDone && overlayTries == 0) {
+            if (seq == grabSeq && overlay != null && !overlayDone && overlayTries == 0) {
                 overlayDone = true
                 removeOverlay()
-                launchGrabActivity()
+                if (grabCopyLike) launchGrabActivity()
+                finishGrab()
             }
-        }, 700)
+        }, 350)
+        // Safety: never stay busy.
+        handler.postDelayed({
+            if (seq == grabSeq && grabBusy) {
+                overlayDone = true
+                removeOverlay()
+                finishGrab()
+            }
+        }, 1500)
+    }
+
+    // ---- the 0.2 second "Copied" label ----
+
+    private var flashView: TextView? = null
+    private val flashOff = Runnable { removeFlash() }
+
+    private fun removeFlash() {
+        val v = flashView
+        flashView = null
+        if (v != null) {
+            try {
+                (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun showFlash(msg: String) {
+        try {
+            handler.removeCallbacks(flashOff)
+            removeFlash()
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val tv = TextView(this)
+            tv.text = msg
+            tv.setTextColor(Color.WHITE)
+            tv.textSize = 16f
+            tv.setTypeface(null, Typeface.BOLD)
+            tv.setPadding(48, 24, 48, 24)
+            val bg = GradientDrawable()
+            bg.setColor(Color.argb(235, 30, 30, 30))
+            bg.cornerRadius = 80f
+            tv.background = bg
+            val lp = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            lp.y = 220
+            wm.addView(tv, lp)
+            flashView = tv
+            handler.postDelayed(flashOff, 200)
+        } catch (e: Exception) {
+            try {
+                Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
+            } catch (e2: Exception) {
+            }
+        }
+    }
+
+    fun registerFlasher() {
+        try {
+            CoreHolder.get(applicationContext).flasher = { m -> handler.post { showFlash(m) } }
+        } catch (t: Throwable) {
+        }
     }
 }
 
@@ -1799,11 +1927,15 @@ class KeepAliveService : Service() {
             val pi = PendingIntent.getActivity(
                 this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
             )
+            val pg = PendingIntent.getActivity(
+                this, 1, Intent(this, ClipGrabActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+            )
             val n = Notification.Builder(this, "lanclip")
                 .setContentTitle("LAN Clipboard is running")
                 .setContentText("Ready to copy & paste between your devices")
                 .setSmallIcon(android.R.drawable.stat_notify_sync)
                 .setContentIntent(pi)
+                .addAction(android.R.drawable.ic_menu_send, "Send clipboard now", pg)
                 .build()
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } catch (e: Exception) {
@@ -2052,7 +2184,7 @@ class MainActivity : Activity() {
     private fun refresh() {
         titleView.text = "LAN Clipboard  -  " + core.myName + (if (core.enabled()) "" else "  (OFF)")
         updateOnOff()
-        autoBtn.text = if (accessibilityOn()) "Auto: ON" else "Auto Setup"
+        autoBtn.text = if (accessibilityOn() && Settings.canDrawOverlays(this)) "Auto: ON" else "Auto Setup"
         val list = ArrayList<Row>()
         list.add(Row(0, "DEVICES (tap = on/off, long-press = forget)", ""))
         val ps = ArrayList<Peer>(core.peers.values)
@@ -2336,17 +2468,25 @@ class MainActivity : Activity() {
 
     private fun openAccessSettings() {
         val items = arrayOf(
-            "1.  Allow restricted settings (do this first)",
-            "2.  Turn on 'LAN Clipboard auto-detect'",
-            "3.  Battery: allow background running"
+            (if (Settings.canDrawOverlays(this)) "1.  Display over other apps: ALLOWED" else "1.  Allow 'Display over other apps'  (REQUIRED)"),
+            "2.  Allow restricted settings (if Android asks)",
+            (if (accessibilityOn()) "3.  Accessibility auto-detect: ON" else "3.  Turn on 'LAN Clipboard auto-detect'"),
+            "4.  Battery: allow background running"
         )
         AlertDialog.Builder(this)
-            .setTitle("Auto-copy setup")
+            .setTitle("Auto-copy setup (do 1, 2, 3, 4)")
             .setItems(items) { _, which ->
                 if (which == 0) {
-                    toast("Tap the 3 dots (top right) and choose 'Allow restricted settings'. If you do not see it, skip to step 2.")
-                    openAppInfo()
+                    toast("Turn ON 'Allow display over other apps' for LAN Clipboard")
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+                    } catch (e: Exception) {
+                        openAppInfo()
+                    }
                 } else if (which == 1) {
+                    toast("Tap the 3 dots (top right) and choose 'Allow restricted settings'. If you do not see it, go to step 3.")
+                    openAppInfo()
+                } else if (which == 2) {
                     toast("Find 'LAN Clipboard auto-detect' and turn it ON")
                     try {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
