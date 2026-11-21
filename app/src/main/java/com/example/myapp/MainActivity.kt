@@ -42,6 +42,7 @@ import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -1917,7 +1918,217 @@ object CoreHolder {
 // ───────────────────────── keep-alive service ─────────────────────────
 
 class KeepAliveService : Service() {
+    private val h = Handler(Looper.getMainLooper())
+    private var root: LinearLayout? = null
+    private var hd: TextView? = null
+    private var panel: LinearLayout? = null
+    private var info: TextView? = null
+    private var lp: WindowManager.LayoutParams? = null
+    private var tickOn = false
+    private var dragSx = 0
+    private var dragSy = 0
+    private var dragTx = 0f
+    private var dragTy = 0f
+    private var dragMoved = false
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private val tick = object : Runnable {
+        override fun run() {
+            try {
+                val core = CoreHolder.get(applicationContext)
+                if (core.enabled()) {
+                    if (root == null) showBubble()
+                    updateBubble(core)
+                }
+            } catch (t: Throwable) {
+            }
+            h.postDelayed(this, 2000)
+        }
+    }
+
+    private fun updateBubble(core: Core) {
+        var n = 0
+        for (p in core.peers.values) {
+            if (p.online()) n++
+        }
+        info?.text = if (n == 0) "No device online" else n.toString() + " device(s) online"
+        val bg = GradientDrawable()
+        bg.shape = GradientDrawable.OVAL
+        bg.setColor(if (n > 0) Color.rgb(46, 125, 50) else Color.rgb(230, 126, 0))
+        hd?.background = bg
+    }
+
+    private fun menuItem(text: String, color: Int, action: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.setTextColor(color)
+        t.textSize = 16f
+        t.setTypeface(null, Typeface.BOLD)
+        t.setPadding(0, dp(12), dp(24), dp(12))
+        t.setOnClickListener {
+            try {
+                action()
+            } catch (e: Exception) {
+            }
+        }
+        return t
+    }
+
+    private fun startScreen(cls: Class<*>) {
+        try {
+            val i = Intent(this, cls)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            startActivity(i)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun togglePanel() {
+        val p = panel ?: return
+        val l = lp ?: return
+        val r = root ?: return
+        if (p.visibility == View.GONE) {
+            val maxY = resources.displayMetrics.heightPixels - dp(260)
+            if (l.y > maxY) l.y = if (maxY > 0) maxY else 0
+            p.visibility = View.VISIBLE
+        } else {
+            p.visibility = View.GONE
+        }
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).updateViewLayout(r, l)
+        } catch (e: Exception) {
+        }
+    }
+
+    // The floating bubble: always on top of every app until you press Close.
+    private fun showBubble() {
+        if (root != null) return
+        if (!Settings.canDrawOverlays(this)) return
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val core = CoreHolder.get(applicationContext)
+            val r = LinearLayout(this)
+            r.orientation = LinearLayout.VERTICAL
+
+            val head = TextView(this)
+            head.text = "LC"
+            head.setTextColor(Color.WHITE)
+            head.textSize = 15f
+            head.setTypeface(null, Typeface.BOLD)
+            head.gravity = Gravity.CENTER
+            r.addView(head, LinearLayout.LayoutParams(dp(52), dp(52)))
+
+            val p = LinearLayout(this)
+            p.orientation = LinearLayout.VERTICAL
+            val pbg = GradientDrawable()
+            pbg.setColor(Color.argb(240, 30, 30, 30))
+            pbg.cornerRadius = dp(14).toFloat()
+            p.background = pbg
+            p.setPadding(dp(14), dp(10), dp(14), dp(6))
+            p.visibility = View.GONE
+            val inf = TextView(this)
+            inf.setTextColor(Color.LTGRAY)
+            inf.textSize = 12f
+            p.addView(inf)
+            p.addView(menuItem("Send clipboard now", Color.WHITE) {
+                togglePanel()
+                startScreen(ClipGrabActivity::class.java)
+            })
+            p.addView(menuItem("Open app", Color.WHITE) {
+                togglePanel()
+                startScreen(MainActivity::class.java)
+            })
+            p.addView(menuItem("Close  \u2715", Color.rgb(255, 120, 120)) {
+                removeBubble()
+                CoreHolder.get(applicationContext).setEnabled(false)
+                Toast.makeText(applicationContext, "LAN Clipboard closed", Toast.LENGTH_SHORT).show()
+            })
+            r.addView(p, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+            val l = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            )
+            l.gravity = Gravity.TOP or Gravity.START
+            val dm = resources.displayMetrics
+            var x = core.prefs.getInt("bx", dp(6))
+            var y = core.prefs.getInt("by", dp(220))
+            if (x < 0 || x > dm.widthPixels - dp(60)) x = dp(6)
+            if (y < 0 || y > dm.heightPixels - dp(120)) y = dp(220)
+            l.x = x
+            l.y = y
+
+            head.setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        dragSx = l.x
+                        dragSy = l.y
+                        dragTx = e.rawX
+                        dragTy = e.rawY
+                        dragMoved = false
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = e.rawX - dragTx
+                        val dy = e.rawY - dragTy
+                        if (Math.abs(dx) > dp(6) || Math.abs(dy) > dp(6)) dragMoved = true
+                        if (dragMoved) {
+                            l.x = dragSx + dx.toInt()
+                            l.y = dragSy + dy.toInt()
+                            try {
+                                wm.updateViewLayout(r, l)
+                            } catch (ex: Exception) {
+                            }
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (!dragMoved) {
+                            togglePanel()
+                        } else {
+                            try {
+                                core.prefs.edit().putInt("bx", l.x).putInt("by", l.y).apply()
+                            } catch (ex: Exception) {
+                            }
+                        }
+                        true
+                    }
+                    else -> false
+                }
+            }
+
+            wm.addView(r, l)
+            root = r
+            hd = head
+            panel = p
+            info = inf
+            lp = l
+            updateBubble(core)
+        } catch (e: Exception) {
+            root = null
+        }
+    }
+
+    private fun removeBubble() {
+        val r = root
+        root = null
+        hd = null
+        panel = null
+        info = null
+        lp = null
+        if (r != null) {
+            try {
+                (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(r)
+            } catch (e: Exception) {
+            }
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
@@ -1941,6 +2152,7 @@ class KeepAliveService : Service() {
         } catch (e: Exception) {
         }
         if (!CoreHolder.get(applicationContext).enabled()) {
+            removeBubble()
             try {
                 stopForeground(true)
             } catch (e: Exception) {
@@ -1949,7 +2161,18 @@ class KeepAliveService : Service() {
             return START_NOT_STICKY
         }
         CoreHolder.get(applicationContext).start()
+        if (!tickOn) {
+            tickOn = true
+            h.post(tick)
+        }
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        tickOn = false
+        h.removeCallbacks(tick)
+        removeBubble()
+        super.onDestroy()
     }
 }
 
